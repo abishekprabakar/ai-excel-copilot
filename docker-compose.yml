@@ -1,0 +1,44 @@
+# Local stack: MinIO stands in for S3, the API runs the same image as Lambda
+# (minus the adapter), nginx serves the UI and proxies /v1 with buffering off.
+#
+#   ANTHROPIC_API_KEY=sk-... docker compose up --build     # omit the key for the offline planner
+#   open http://localhost:8088
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: copilot
+      MINIO_ROOT_PASSWORD: copilot-secret
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      retries: 20
+
+  bucket:
+    image: quay.io/minio/mc:latest
+    depends_on: { minio: { condition: service_healthy } }
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 copilot copilot-secret &&
+             mc mb --ignore-existing local/excel-copilot-artifacts"
+
+  api:
+    build: { context: ./backend, target: local }
+    depends_on: { bucket: { condition: service_completed_successfully } }
+    environment:
+      ARTIFACT_BUCKET: excel-copilot-artifacts
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:9000   # presigned URLs must use a host the browser can reach
+      AWS_ACCESS_KEY_ID: copilot
+      AWS_SECRET_ACCESS_KEY: copilot-secret
+      AWS_REGION: us-east-1
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      EXCEL_COPILOT_MODEL: ${EXCEL_COPILOT_MODEL:-claude-sonnet-5}
+      CORS_ORIGINS: http://localhost:8088
+    ports: ["8080:8080"]
+
+  ui:
+    build: { context: ./frontend }
+    depends_on: [api]
+    ports: ["8088:80"]

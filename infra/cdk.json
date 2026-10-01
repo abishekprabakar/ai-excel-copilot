@@ -1,0 +1,8 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "anthropicSecretName": "excel-copilot/anthropic-api-key",
+    "model": "claude-sonnet-5",
+    "artifactRetentionDays": 7
+  }
+}
