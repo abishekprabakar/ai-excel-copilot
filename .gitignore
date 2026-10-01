@@ -7,3 +7,6 @@ frontend/dist/
 infra/cdk.out/
 .env
 frontend/tsconfig.tsbuildinfo
+.venv/
+node_modules/
+eval_report.json

@@ -106,9 +106,13 @@ def cmd_eval(a) -> int:
     for r in results:
         mark = "PASS" if r.passed else "FAIL"
         tok = f"{r.tokens_in:>6} in {r.tokens_out:>5} out" if r.tokens_in else ""
-        print(f"{mark}  {r.id:<{width}}  {r.seconds:>5.2f}s  {tok}  {'' if r.passed else r.detail}")
+        print(f"{mark}  {r.id:<{width}}  {r.seconds:>5.2f}s  {tok}  {r.detail if (not r.passed or r.detail != 'ok') else ''}")
     n = sum(r.passed for r in results)
     print(f"\n{n}/{len(results)} passed ({n / len(results):.0%})")
+    if a.report:
+        import dataclasses
+        Path(a.report).write_text(json.dumps([dataclasses.asdict(r) for r in results], indent=1, default=str))
+        print(f"details written to {a.report}")
     return 0
 
 
@@ -131,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                                                                            help="print raw events as JSON lines")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("eval"); p.add_argument("spec")
+    p.add_argument("--report", default="eval_report.json", help="where to write per-case details ('' to skip)")
     p.add_argument("--llm", choices=["auto", "claude", "offline"], default="auto"); p.set_defaults(fn=cmd_eval)
     p = sub.add_parser("serve"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8000)
     p.set_defaults(fn=cmd_serve)

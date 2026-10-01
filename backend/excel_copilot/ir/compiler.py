@@ -50,6 +50,13 @@ class Compiled:
         return [d for d in self.diagnostics if d.severity == "error"]
 
 
+class _OpenSchema(dict):
+    """Schema of a pivot output: its value columns are only known at runtime."""
+
+    def __missing__(self, key):
+        return "num"
+
+
 class _Fail(Exception):
     def __init__(self, field: str, message: str, hint: str | None = None):
         super().__init__(message)
@@ -68,6 +75,7 @@ def compile_program(program: Program, profile: WorkbookProfile) -> Compiled:
     schemas: dict[str, dict[str, EType]] = {}
     roles: dict[str, dict[str, str]] = {}          # frame -> column -> profile role (for semantic checks)
     opaque: set[str] = set()                        # frames from pivot: columns unknown until runtime
+    failed: set[str] = set()                        # frames whose step was rejected
     lines = ["def run(tables):"]
     tables_used: list[str] = []
     table_ids = [t.id for t in profile.tables]
@@ -91,6 +99,13 @@ def compile_program(program: Program, profile: WorkbookProfile) -> Compiled:
                 raise _Fail(fld, f"column {c!r} does not exist in frame {src!r}", _suggest(c, list(schema)))
 
     for i, step in enumerate(program.steps):
+        inputs = [getattr(step, a) for a in ("input", "left", "right") if hasattr(step, a)]
+        if any(x in failed for x in inputs):
+            # an upstream step was already rejected; don't pile on errors computed from a guess
+            if step.out not in schemas:
+                schemas[step.out], roles[step.out] = {}, {}
+                failed.add(step.out)
+            continue
         try:
             out = step.out
             if not _FRAME.match(out) or out in RESERVED:
@@ -248,7 +263,7 @@ def compile_program(program: Program, profile: WorkbookProfile) -> Compiled:
                 cols(src, step.index + [step.columns, step.values], "index", step.input)
                 if step.func in NUMERIC_AGGS and src[step.values] != "num":
                     raise _Fail("values", f"{step.func} needs numeric values")
-                schema = {c: src[c] for c in step.index}
+                schema = _OpenSchema({c: src[c] for c in step.index})
                 roles[out] = {c: roles[step.input].get(c, "") for c in step.index}
                 opaque.add(out)
                 code = (f"xl.pivot({step.input}, {list(step.index)!r}, {step.columns!r}, "
@@ -258,13 +273,15 @@ def compile_program(program: Program, profile: WorkbookProfile) -> Compiled:
 
             schemas[out] = schema
             lines.append(f"    {out} = {code}")
-        except _Fail as f:
-            diags.append(Diagnostic(step=i, field=f.field, message=f.message, hint=f.hint))
-            # keep going with an empty schema so later steps report their own errors
+        except Exception as f:  # noqa: BLE001 - every failure becomes a diagnostic, never a crash
+            if isinstance(f, _Fail):
+                diags.append(Diagnostic(step=i, field=f.field, message=f.message, hint=f.hint))
+            else:
+                diags.append(Diagnostic(step=i, field=getattr(step, "op", "step"),
+                                        message=f"could not check this step ({type(f).__name__}: {f})"))
             if getattr(step, "out", None) and step.out not in schemas:
-                schemas[step.out] = {}
-                opaque.add(step.out)
-                roles[step.out] = {}
+                schemas[step.out], roles[step.out] = {}, {}
+                failed.add(step.out)
 
     if program.output not in schemas:
         diags.append(Diagnostic(step=None, field="output", message=f"output frame {program.output!r} is not defined",
@@ -276,6 +293,15 @@ def compile_program(program: Program, profile: WorkbookProfile) -> Compiled:
                 if hasattr(s, attr):
                     used.add(getattr(s, attr))
         dead = [s.out for s in program.steps if s.out not in used and s.out != program.output]
+        last = program.steps[-1].out if program.steps else None
+        if last in dead:
+            # the final step's work would be silently discarded (e.g. a top-N limit
+            # computed but `output` pointing at the frame before it)
+            diags.append(Diagnostic(step=len(program.steps) - 1, field="output",
+                                    message=f"the last step produces {last!r} but output is "
+                                            f"{program.output!r}, so that step's result is discarded",
+                                    hint=f"set output to {last!r}, or remove the step"))
+            dead.remove(last)
         if dead:
             diags.append(Diagnostic(step=None, field="steps", severity="warning",
                                     message=f"frames never used: {', '.join(dead)}"))

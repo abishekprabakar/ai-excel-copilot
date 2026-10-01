@@ -33,21 +33,29 @@ compiler; you never write Python.
 
 IR: a list of steps. Each step creates a new frame named by `out` (snake_case,
 unique, not one of: tables, xl, pd, np, run, result, df).
-  load      {table}                                   start from a workbook table (table id)
-  filter    {input, condition}                        keep rows where condition is true
-  derive    {input, column, expression}               add or replace a column
-  select    {input, columns}                          keep and order columns
-  aggregate {input, group_by, aggregations:[{column, func, as_name}]}
+
+Every step object has ALL of these fields. Fill the ones its `op` uses and leave
+the rest empty ("" for text, [] for lists, 0 for n):
+  op  out  input  table  condition  column  expression  columns  group_by
+  aggregations  left  right  left_on  right_on  how  by  n  id_columns
+  value_columns  var_name  value_name  index  pivot_columns  values  func
+
+Fields used by each op:
+  load      table                                     start from a workbook table (table id)
+  filter    input, condition                          keep rows where condition is true
+  derive    input, column, expression                 add or replace a column
+  select    input, columns                            keep and order columns
+  aggregate input, group_by, aggregations:[{column, func, as_name}]
             func: sum mean median min max count nunique std; column '*' with count = rows
             empty group_by = one grand-total row
-  join      {left, right, left_on, right_on, how: inner|left}
+  join      left, right, left_on, right_on, how (inner|left)
             same-named keys are kept once; other clashing right columns get suffix _right
-  sort      {input, by:[{column, descending}]}
-  limit     {input, n}
-  unpivot   {input, id_columns, value_columns, var_name, value_name}
-  pivot     {input, index, columns, values, func}     must be the last data step
-`output` names the final frame; `title` is a short caption; `chart` is
-{kind: none|bar|line, x, y} over output columns (use '' for x/y when none).
+  sort      input, by:[{column, descending}]
+  limit     input, n
+  unpivot   input, id_columns, value_columns, var_name, value_name
+  pivot     input, index, pivot_columns, values, func   must be the last data step
+Top level: `steps`, `output` (name of the final frame), `title` (short caption),
+`chart_kind` (none|bar|line), `chart_x` and `chart_y` (output columns, or "" when none).
 
 Expression language (conditions and derive expressions):
 - Columns: bare name if it is an identifier (Revenue), otherwise backticks

@@ -115,3 +115,35 @@ def test_join_schema_tracks_suffixes(demo):
         {"op": "select", "out": "s", "input": "j", "columns": ["SKU", "Unit Cost", "Unit Cost_right", "Category"]}],
         "s"), demo)
     assert c.ok, [d.render() for d in c.diagnostics]
+
+
+def test_discarded_final_step_is_an_error(demo):
+    # seen live: Claude computed a top-1 limit but pointed `output` at the frame before it
+    c, errs = errors(program([
+        {"op": "load", "out": "o", "table": "orders"},
+        {"op": "aggregate", "out": "a", "input": "o", "group_by": ["Region"],
+         "aggregations": [{"column": "Revenue", "func": "sum", "as_name": "Revenue"}]},
+        {"op": "limit", "out": "top", "input": "a", "n": 1}], "a"), demo)
+    assert not c.ok and any("result is discarded" in e and "set output to 'top'" in e for e in errs)
+
+
+def test_steps_after_a_rejected_step_do_not_crash_the_compiler(demo):
+    # seen live: a failed derive left an empty schema, and a later select crashed with KeyError
+    c, errs = errors(program([
+        {"op": "load", "out": "o", "table": "orders"},
+        {"op": "aggregate", "out": "a", "input": "o", "group_by": ["Segment"],          # orders has no Segment
+         "aggregations": [{"column": "Revenue", "func": "sum", "as_name": "Enterprise Revenue"}]},
+        {"op": "select", "out": "s", "input": "a", "columns": ["Enterprise Revenue"]},
+        {"op": "join", "out": "j", "left": "s", "right": "o", "left_on": ["x"], "right_on": ["Region"], "how": "left"}],
+        "j"), demo)
+    assert not c.ok
+    assert len(errs) == 1 and "Segment" in errs[0]        # only the root cause is reported
+
+
+def test_columns_after_pivot_are_open(demo):
+    c, errs = errors(program([
+        {"op": "load", "out": "o", "table": "orders"},
+        {"op": "pivot", "out": "p", "input": "o", "index": ["Region"], "columns": "Status", "values": "Revenue",
+         "func": "sum"},
+        {"op": "select", "out": "s", "input": "p", "columns": ["Region", "Shipped"]}], "s"), demo)
+    assert c.ok, errs

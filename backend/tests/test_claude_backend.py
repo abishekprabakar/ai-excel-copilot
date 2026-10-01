@@ -12,6 +12,8 @@ import pytest
 
 from excel_copilot.llm.base import LLMError, Turn
 from excel_copilot.llm.claude import ClaudeBackend
+from excel_copilot.ir.models import Program
+from excel_copilot.ir.wire import from_program
 from excel_copilot.pipeline import run_question
 
 from .conftest import plan as mkplan
@@ -22,15 +24,16 @@ PROGRAM = {"steps": [{"op": "load", "out": "o", "table": "orders"},
                      {"op": "aggregate", "out": "g", "input": "o", "group_by": ["Region"],
                       "aggregations": [{"column": "Revenue", "func": "sum", "as_name": "Revenue"}]}],
            "output": "g", "title": "Revenue by region", "chart": {"kind": "bar", "x": "Region", "y": "Revenue"}}
+WIRE = json.loads(from_program(Program.model_validate(PROGRAM)).model_dump_json())   # what the coder emits
 
 
-def reply(payload, stop="end_turn", status=200):
+def reply(payload, stop="end_turn", status=200, error=None):
     def make(body):
         if status != 200:
-            return httpx2.Response(status, json={"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+            return httpx2.Response(status, json={"type": "error", "error": error or {"type": "overloaded_error", "message": "Overloaded"}})
         return httpx2.Response(200, json={
             "id": "msg_x", "type": "message", "role": "assistant", "model": body["model"],
-            "content": [{"type": "text", "text": json.dumps(payload)}], "stop_reason": stop, "stop_sequence": None,
+            "content": [{"type": "text", "text": payload if isinstance(payload, str) else json.dumps(payload)}], "stop_reason": stop, "stop_sequence": None,
             "usage": {"input_tokens": 900, "output_tokens": 120, "cache_read_input_tokens": 700,
                       "cache_creation_input_tokens": 0}})
     return make
@@ -63,7 +66,7 @@ def test_request_shape_and_parsing():
 
 
 def test_program_schema_and_repair_turns():
-    be, seen = backend(reply(PROGRAM))
+    be, seen = backend(reply(WIRE))
     hist = [Turn("assistant", '{"bad": 1}'), Turn("user", "fix step 1")]
     prog, _ = be.code("q", mkplan(), "ctx", None, hist)
     assert prog.output == "g"
@@ -72,6 +75,8 @@ def test_program_schema_and_repair_turns():
     schema = json.dumps(seen[0]["output_config"]["format"]["schema"])
     for op in ("load", "filter", "derive", "select", "aggregate", "join", "sort", "limit", "unpivot", "pivot"):
         assert f'"{op}"' in schema
+    # the flat wire schema exists to keep the compiled grammar small: no unions at all
+    assert "anyOf" not in schema and len(schema) < 4000
 
 
 @pytest.mark.parametrize("responder,needle", [
@@ -87,9 +92,39 @@ def test_failures_raise_llm_error(responder, needle):
 
 
 def test_full_pipeline_with_mocked_claude(demo):
-    be, seen = backend(reply(PLAN), reply(PROGRAM))
+    be, seen = backend(reply(PLAN), reply(WIRE))
     evs = list(run_question("revenue by region", demo.profile, demo.frames, be))
     assert evs[-1].data["ok"] and evs[-1].data["tokens"] == {"input": 1800, "output": 240}
     # the coder sees a restricted, detailed view of only the planned tables
     coder_ctx = seen[1]["system"][1]["text"]
     assert "TABLE orders" in coder_ctx and "TABLE customers" not in coder_ctx
+
+
+GRAMMAR = {"type": "invalid_request_error", "message": "The compiled grammar is too large, which would cause "
+           "performance issues. Simplify your tool schemas or reduce the number of strict tools."}
+
+
+def test_grammar_too_large_falls_back_to_validated_json():
+    be, seen = backend(reply(None, status=400, error=GRAMMAR),
+                       reply("Here you go:\n```json\n" + json.dumps(WIRE) + "\n```"),
+                       reply(WIRE))
+    prog, usage = be.code("q", mkplan(), "ctx", None, [])
+    assert prog.output == "g" and "output_config" not in seen[1]
+    assert "JSON schema" in seen[1]["system"][0]["text"] and usage.input_tokens == 900
+    be.code("q", mkplan(), "ctx", None, [])            # fallback is remembered: no second 400
+    assert len(seen) == 3 and "output_config" not in seen[2]
+
+
+def test_unconstrained_bad_json_gets_one_retry():
+    be, seen = backend(reply(None, status=400, error=GRAMMAR), reply("not json at all"), reply(WIRE))
+    prog, _ = be.code("q", mkplan(), "ctx", None, [])
+    assert prog.output == "g" and seen[2]["messages"][-1]["content"].startswith("That was not valid JSON")
+
+
+def test_wire_problems_are_sent_back_to_the_model():
+    bad = json.loads(json.dumps(WIRE))
+    bad["steps"][1]["aggregations"][0]["func"] = "total"
+    be, seen = backend(reply(bad), reply(WIRE))
+    prog, _ = be.code("q", mkplan(), "ctx", None, [])
+    assert prog.output == "g"
+    assert "step 1" in seen[1]["messages"][-1]["content"] and "total" in seen[1]["messages"][-1]["content"]

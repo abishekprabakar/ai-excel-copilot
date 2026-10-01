@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .ir.compiler import compile_program
@@ -29,11 +31,18 @@ from .profiler import profile_workbook
 from .sandbox.executor import execute
 
 
+# labels people (and models) use for a missing group key; compared as missing
+NULL_LABELS = {"", "unknown", "unmatched", "(missing)", "missing", "n/a", "na", "none", "null", "(blank)", "blank",
+               "unassigned", "no match", "(none)"}
+
+
 def _norm(v):
+    if isinstance(v, str) and v.strip().lower() in NULL_LABELS:
+        return None
     if v is None or (isinstance(v, float) and math.isnan(v)) or v is pd.NA or v is pd.NaT:
         return None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return float(v)
+    if isinstance(v, numbers.Number) and not isinstance(v, (bool, np.bool_)):
+        return float(v)            # covers numpy scalars too
     if isinstance(v, pd.Timestamp):
         return v.isoformat()
     return str(v).strip().lower()
@@ -59,12 +68,12 @@ def matches(answer: pd.DataFrame, expected: pd.DataFrame, ordered: bool = False)
     if len(answer) != len(expected):
         return False, f"{len(answer)} rows, expected {len(expected)}"
     ans_cols = {c: [_norm(v) for v in answer[c].tolist()] for c in answer.columns}
-    used: set = set()
+    mapping: dict = {}
     for ec in expected.columns:
         exp = [_norm(v) for v in expected[ec].tolist()]
         hit = None
         for ac, vals in ans_cols.items():
-            if ac in used:
+            if ac in mapping.values():
                 continue
             if ordered or len(expected) <= 1:
                 ok = _same(vals, exp)
@@ -75,15 +84,12 @@ def matches(answer: pd.DataFrame, expected: pd.DataFrame, ordered: bool = False)
                 break
         if hit is None:
             return False, f"no answer column matches expected column {ec!r}"
-        used.add(hit)
+        mapping[ec] = hit
     if not ordered and len(expected.columns) > 1 and len(expected) > 1:
         # values matched column-wise; also require the rows to line up as tuples
-        mapping = {}
-        for ec in expected.columns:
-            mapping[ec] = next(ac for ac in used if _same(sorted(ans_cols[ac], key=_key),
-                                                          sorted([_norm(v) for v in expected[ec]], key=_key)))
-        a_rows = sorted(zip(*[ans_cols[mapping[ec]] for ec in expected.columns]), key=lambda t: [_key(x) for x in t])
-        e_rows = sorted(zip(*[[_norm(v) for v in expected[ec]] for ec in expected.columns]), key=lambda t: [_key(x) for x in t])
+        cols = list(expected.columns)
+        a_rows = sorted(zip(*[ans_cols[mapping[ec]] for ec in cols]), key=lambda t: [_key(x) for x in t])
+        e_rows = sorted(zip(*[[_norm(v) for v in expected[ec].tolist()] for ec in cols]), key=lambda t: [_key(x) for x in t])
         if not all(_same(list(x), list(y)) for x, y in zip(a_rows, e_rows)):
             return False, "columns match individually but rows do not line up"
     return True, "ok"
@@ -99,6 +105,14 @@ class CaseResult:
     tokens_in: int
     tokens_out: int
     repairs: int
+    trace: dict | None = None     # plan, program, answer and expected previews (for the report)
+
+
+def _preview(df: pd.DataFrame | None, n: int = 15) -> dict | None:
+    if df is None:
+        return None
+    return {"columns": [str(c) for c in df.columns],
+            "rows": json.loads(df.head(n).to_json(orient="values", date_format="iso")), "n_rows": len(df)}
 
 
 def run_eval(path: str | Path, backend: Backend) -> list[CaseResult]:
@@ -107,33 +121,56 @@ def run_eval(path: str | Path, backend: Backend) -> list[CaseResult]:
     res = profile_workbook(wb_path.read_bytes(), wb_path.name)
     out = []
     for case in spec["cases"]:
-        ref = Program(steps=case["reference"], output=case["reference"][-1]["out"], title="ref",
-                      chart=Chart(kind="none", x="", y=""))
-        comp = compile_program(ref, res.profile)
-        if not comp.ok:
-            raise ValueError(f"reference for {case['id']} is invalid: {[d.render() for d in comp.errors]}")
-        expected = execute(comp.source, {t: res.frames[t] for t in comp.tables_used})
-        if not expected.ok:
-            raise ValueError(f"reference for {case['id']} failed: {expected.error}")
+        # A case may list alternative references for questions with more than one
+        # defensible reading; an answer passes if it matches any of them.
+        refs = [("primary", case["reference"])] + [(a["label"], a["reference"]) for a in case.get("alternatives", [])]
+        expected_frames = []
+        for label, steps in refs:
+            ref = Program(steps=steps, output=steps[-1]["out"], title="ref", chart=Chart(kind="none", x="", y=""))
+            comp = compile_program(ref, res.profile)
+            if not comp.ok:
+                raise ValueError(f"reference {label!r} for {case['id']} is invalid: {[d.render() for d in comp.errors]}")
+            exp = execute(comp.source, {t: res.frames[t] for t in comp.tables_used})
+            if not exp.ok:
+                raise ValueError(f"reference {label!r} for {case['id']} failed: {exp.error}")
+            expected_frames.append((label, exp.frame))
         t0 = time.perf_counter()
         answer = None
         detail = "no result"
         tin = tout = repairs = 0
-        for ev in run_question(case["question"], res.profile, res.frames, backend):
-            if ev.type == "result":
-                answer = pd.DataFrame(ev.data["rows"], columns=[c["name"] for c in ev.data["columns"]])
-            elif ev.type == "diagnostics" and not ev.data["ok"]:
-                repairs += 1
-            elif ev.type == "error":
-                detail = f"{ev.data['stage']}: {ev.data['message']}"
-            elif ev.type == "done":
-                tin = ev.data.get("tokens", {}).get("input", 0)
-                tout = ev.data.get("tokens", {}).get("output", 0)
-                if ev.data.get("answerable") is False:
-                    detail = f"declined: {ev.data.get('reason')}"
-        passed = False
+        plan = program = None
+        try:
+            for ev in run_question(case["question"], res.profile, res.frames, backend):
+                if ev.type == "result":
+                    answer = pd.DataFrame(ev.data["rows"], columns=[c["name"] for c in ev.data["columns"]])
+                elif ev.type == "plan":
+                    plan = ev.data["plan"]
+                elif ev.type == "ir":
+                    program = ev.data["program"]
+                elif ev.type == "diagnostics" and not ev.data["ok"]:
+                    repairs += 1
+                elif ev.type == "error":
+                    detail = f"{ev.data['stage']}: {ev.data['message']}"
+                elif ev.type == "done":
+                    tin = ev.data.get("tokens", {}).get("input", 0)
+                    tout = ev.data.get("tokens", {}).get("output", 0)
+                    if ev.data.get("answerable") is False:
+                        detail = f"declined: {ev.data.get('reason')}"
+        except Exception as e:  # one broken case must not abort the whole eval
+            detail = f"crashed: {type(e).__name__}: {e}"
+            answer = None
+        passed, matched = False, None
         if answer is not None:
-            passed, detail = matches(answer, expected.frame, bool(case.get("ordered")))
+            for label, frame in expected_frames:
+                ok, why = matches(answer, frame, bool(case.get("ordered")))
+                if ok:
+                    passed, matched, detail = True, label, "ok" if label == "primary" else f"ok ({label})"
+                    break
+                if label == "primary":
+                    detail = why
         out.append(CaseResult(case["id"], case["question"], passed, detail, round(time.perf_counter() - t0, 2),
-                              tin, tout, repairs))
+                              tin, tout, repairs,
+                              {"plan": plan, "program": program, "answer": _preview(answer),
+                               "matched": matched,
+                               "expected": {label: _preview(f) for label, f in expected_frames}}))
     return out
